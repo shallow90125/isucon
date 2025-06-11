@@ -15,7 +15,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/bradfitz/gomemcache/memcache"
@@ -30,20 +29,7 @@ var (
 	db    *sqlx.DB
 	store *gsm.MemcacheStore
 	memcacheClient *memcache.Client
-	userRegisterQueue chan UserRegisterJob
-	userRegisterWG sync.WaitGroup
 )
-
-type UserRegisterJob struct {
-	AccountName string
-	Passhash    string
-	ResponseCh  chan UserRegisterResult
-}
-
-type UserRegisterResult struct {
-	UserID int64
-	Error  error
-}
 
 const (
 	postsPerPage  = 20
@@ -90,32 +76,6 @@ func init() {
 	memcacheClient = memcache.New(memdAddr)
 	store = gsm.NewMemcacheStore(memcacheClient, "iscogram_", []byte("sendagaya"))
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
-
-	// jobqueue初期化
-	userRegisterQueue = make(chan UserRegisterJob, 100)
-	startUserRegisterWorker()
-}
-
-func startUserRegisterWorker() {
-	userRegisterWG.Add(1)
-	go func() {
-		defer userRegisterWG.Done()
-		for job := range userRegisterQueue {
-			processUserRegisterJob(job)
-		}
-	}()
-}
-
-func processUserRegisterJob(job UserRegisterJob) {
-	query := "INSERT INTO `users` (`account_name`, `passhash`) VALUES (?,?)"
-	result, err := db.Exec(query, job.AccountName, job.Passhash)
-	if err != nil {
-		job.ResponseCh <- UserRegisterResult{Error: err}
-		return
-	}
-
-	uid, err := result.LastInsertId()
-	job.ResponseCh <- UserRegisterResult{UserID: uid, Error: err}
 }
 
 func dbInitialize() {
@@ -511,47 +471,22 @@ func postRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// jobqueueを使った遅延書き込み
-	responseCh := make(chan UserRegisterResult, 1)
-	job := UserRegisterJob{
-		AccountName: accountName,
-		Passhash:    calculatePasshash(accountName, password),
-		ResponseCh:  responseCh,
+	query := "INSERT INTO `users` (`account_name`, `passhash`) VALUES (?,?)"
+	result, err := db.Exec(query, accountName, calculatePasshash(accountName, password))
+	if err != nil {
+		log.Print(err)
+		return
 	}
 
-	// ノンブロッキングでキューに送信
-	select {
-	case userRegisterQueue <- job:
-		// キューに正常に送信された場合、結果を待つ
-		result := <-responseCh
-		if result.Error != nil {
-			log.Print(result.Error)
-			return
-		}
-
-		session := getSession(r)
-		session.Values["user_id"] = result.UserID
-		session.Values["csrf_token"] = secureRandomStr(16)
-		session.Save(r, w)
-	default:
-		// キューが満杯の場合は従来通りの同期処理
-		query := "INSERT INTO `users` (`account_name`, `passhash`) VALUES (?,?)"
-		result, err := db.Exec(query, accountName, calculatePasshash(accountName, password))
-		if err != nil {
-			log.Print(err)
-			return
-		}
-
-		session := getSession(r)
-		uid, err := result.LastInsertId()
-		if err != nil {
-			log.Print(err)
-			return
-		}
-		session.Values["user_id"] = uid
-		session.Values["csrf_token"] = secureRandomStr(16)
-		session.Save(r, w)
+	session := getSession(r)
+	uid, err := result.LastInsertId()
+	if err != nil {
+		log.Print(err)
+		return
 	}
+	session.Values["user_id"] = uid
+	session.Values["csrf_token"] = secureRandomStr(16)
+	session.Save(r, w)
 
 	http.Redirect(w, r, "/", http.StatusFound)
 }
