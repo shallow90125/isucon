@@ -2,6 +2,7 @@ package main
 
 import (
 	crand "crypto/rand"
+	"encoding/json"
 	"fmt"
 	"html/template"
 	"io"
@@ -27,6 +28,7 @@ import (
 var (
 	db    *sqlx.DB
 	store *gsm.MemcacheStore
+	memcacheClient *memcache.Client
 )
 
 const (
@@ -71,7 +73,7 @@ func init() {
 	if memdAddr == "" {
 		memdAddr = "localhost:11211"
 	}
-	memcacheClient := memcache.New(memdAddr)
+	memcacheClient = memcache.New(memdAddr)
 	store = gsm.NewMemcacheStore(memcacheClient, "iscogram_", []byte("sendagaya"))
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
 }
@@ -150,9 +152,29 @@ func getSessionUser(r *http.Request) User {
 
 	u := User{}
 
-	err := db.Get(&u, "SELECT * FROM `users` WHERE `id` = ?", uid)
+	// キャッシュから取得を試行
+	cacheKey := fmt.Sprintf("user:%v", uid)
+	item, err := memcacheClient.Get(cacheKey)
+	if err == nil {
+		// キャッシュヒット
+		if err := json.Unmarshal(item.Value, &u); err == nil {
+			return u
+		}
+	}
+
+	// キャッシュミス、DBから取得
+	err = db.Get(&u, "SELECT * FROM `users` WHERE `id` = ?", uid)
 	if err != nil {
 		return User{}
+	}
+
+	// キャッシュに保存
+	if userJSON, err := json.Marshal(u); err == nil {
+		memcacheClient.Set(&memcache.Item{
+			Key:        cacheKey,
+			Value:      userJSON,
+			Expiration: 300, // 5分
+		})
 	}
 
 	return u
@@ -175,25 +197,98 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 	var posts []Post
 
 	for _, p := range results {
-		err := db.Get(&p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
-		if err != nil {
-			return nil, err
+		// キャッシュからコメント数を取得
+		cacheKey := fmt.Sprintf("comment_count:%d", p.ID)
+		item, err := memcacheClient.Get(cacheKey)
+		if err == nil {
+			// キャッシュヒット
+			if err := json.Unmarshal(item.Value, &p.CommentCount); err != nil {
+				// キャッシュが壊れている場合はDBから取得
+				err = db.Get(&p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
+				if err != nil {
+					return nil, err
+				}
+			}
+		} else {
+			// キャッシュミス、DBから取得
+			err = db.Get(&p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
+			if err != nil {
+				return nil, err
+			}
+
+			// キャッシュに保存
+			if countJSON, err := json.Marshal(p.CommentCount); err == nil {
+				memcacheClient.Set(&memcache.Item{
+					Key:        cacheKey,
+					Value:      countJSON,
+					Expiration: 180, // 3分
+				})
+			}
 		}
 
-		query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC"
-		if !allComments {
-			query += " LIMIT 3"
-		}
 		var comments []Comment
-		err = db.Select(&comments, query, p.ID)
-		if err != nil {
-			return nil, err
+
+		// キャッシュからコメント一覧を取得
+		commentsCacheKey := fmt.Sprintf("comments:%d:%t", p.ID, allComments)
+		item, err = memcacheClient.Get(commentsCacheKey)
+		if err == nil {
+			// キャッシュヒット
+			if err := json.Unmarshal(item.Value, &comments); err != nil {
+				// キャッシュが壊れている場合はDBから取得
+				query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC"
+				if !allComments {
+					query += " LIMIT 3"
+				}
+				err = db.Select(&comments, query, p.ID)
+				if err != nil {
+					return nil, err
+				}
+			}
+		} else {
+			// キャッシュミス、DBから取得
+			query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC"
+			if !allComments {
+				query += " LIMIT 3"
+			}
+			err = db.Select(&comments, query, p.ID)
+			if err != nil {
+				return nil, err
+			}
+
+			// キャッシュに保存
+			if commentsJSON, err := json.Marshal(comments); err == nil {
+				memcacheClient.Set(&memcache.Item{
+					Key:        commentsCacheKey,
+					Value:      commentsJSON,
+					Expiration: 180, // 3分
+				})
+			}
 		}
 
 		for i := 0; i < len(comments); i++ {
-			err := db.Get(&comments[i].User, "SELECT * FROM `users` WHERE `id` = ?", comments[i].UserID)
+			// キャッシュからユーザー情報を取得
+			cacheKey := fmt.Sprintf("user:%d", comments[i].UserID)
+			item, err := memcacheClient.Get(cacheKey)
+			if err == nil {
+				// キャッシュヒット
+				if err := json.Unmarshal(item.Value, &comments[i].User); err == nil {
+					continue
+				}
+			}
+
+			// キャッシュミス、DBから取得
+			err = db.Get(&comments[i].User, "SELECT * FROM `users` WHERE `id` = ?", comments[i].UserID)
 			if err != nil {
 				return nil, err
+			}
+
+			// キャッシュに保存
+			if userJSON, err := json.Marshal(comments[i].User); err == nil {
+				memcacheClient.Set(&memcache.Item{
+					Key:        cacheKey,
+					Value:      userJSON,
+					Expiration: 300, // 5分
+				})
 			}
 		}
 
@@ -204,9 +299,33 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 
 		p.Comments = comments
 
-		err = db.Get(&p.User, "SELECT * FROM `users` WHERE `id` = ?", p.UserID)
-		if err != nil {
-			return nil, err
+		// キャッシュから投稿者情報を取得
+		cacheKey = fmt.Sprintf("user:%d", p.UserID)
+		item, err = memcacheClient.Get(cacheKey)
+		if err == nil {
+			// キャッシュヒット
+			if err := json.Unmarshal(item.Value, &p.User); err != nil {
+				// キャッシュミス、DBから取得
+				err = db.Get(&p.User, "SELECT * FROM `users` WHERE `id` = ?", p.UserID)
+				if err != nil {
+					return nil, err
+				}
+			}
+		} else {
+			// キャッシュミス、DBから取得
+			err = db.Get(&p.User, "SELECT * FROM `users` WHERE `id` = ?", p.UserID)
+			if err != nil {
+				return nil, err
+			}
+
+			// キャッシュに保存
+			if userJSON, err := json.Marshal(p.User); err == nil {
+				memcacheClient.Set(&memcache.Item{
+					Key:        cacheKey,
+					Value:      userJSON,
+					Expiration: 300, // 5分
+				})
+			}
 		}
 
 		p.CSRFToken = csrfToken
@@ -679,10 +798,36 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	post := Post{}
-	err = db.Get(&post, "SELECT * FROM `posts` WHERE `id` = ?", pid)
-	if err != nil {
-		log.Print(err)
-		return
+
+	// キャッシュから投稿データを取得
+	cacheKey := fmt.Sprintf("post:%d", pid)
+	item, err := memcacheClient.Get(cacheKey)
+	if err == nil {
+		// キャッシュヒット
+		if err := json.Unmarshal(item.Value, &post); err != nil {
+			// キャッシュが壊れている場合はDBから取得
+			err = db.Get(&post, "SELECT * FROM `posts` WHERE `id` = ?", pid)
+			if err != nil {
+				log.Print(err)
+				return
+			}
+		}
+	} else {
+		// キャッシュミス、DBから取得
+		err = db.Get(&post, "SELECT * FROM `posts` WHERE `id` = ?", pid)
+		if err != nil {
+			log.Print(err)
+			return
+		}
+
+		// キャッシュに保存
+		if postJSON, err := json.Marshal(post); err == nil {
+			memcacheClient.Set(&memcache.Item{
+				Key:        cacheKey,
+				Value:      postJSON,
+				Expiration: 600, // 10分
+			})
+		}
 	}
 
 	ext := r.PathValue("ext")
