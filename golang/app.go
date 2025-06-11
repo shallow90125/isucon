@@ -194,151 +194,168 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 }
 
 func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, error) {
+	if len(results) == 0 {
+		return []Post{}, nil
+	}
+
 	var posts []Post
 
-	for _, p := range results {
-		// キャッシュからコメント数を取得
-		cacheKey := fmt.Sprintf("comment_count:%d", p.ID)
-		item, err := memcacheClient.Get(cacheKey)
-		if err == nil {
-			// キャッシュヒット
-			if err := json.Unmarshal(item.Value, &p.CommentCount); err != nil {
-				// キャッシュが壊れている場合はDBから取得
-				err = db.Get(&p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
-				if err != nil {
-					return nil, err
-				}
-			}
-		} else {
-			// キャッシュミス、DBから取得
-			err = db.Get(&p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
-			if err != nil {
-				return nil, err
-			}
+	// 投稿IDリストを作成
+	postIDs := make([]int, len(results))
+	postIDMap := make(map[int]*Post)
+	for i, p := range results {
+		postIDs[i] = p.ID
+		// ポインタでマップに保存（後で参照を更新するため）
+		posts = append(posts, p)
+		postIDMap[p.ID] = &posts[i]
+	}
 
-			// キャッシュに保存
-			if countJSON, err := json.Marshal(p.CommentCount); err == nil {
-				memcacheClient.Set(&memcache.Item{
-					Key:        cacheKey,
-					Value:      countJSON,
-					Expiration: 180, // 3分
-				})
-			}
+	// 1. 一括でコメント数を取得
+	commentCounts := make(map[int]int)
+	placeholders1 := make([]string, len(postIDs))
+	args1 := make([]interface{}, len(postIDs))
+	for i, id := range postIDs {
+		placeholders1[i] = "?"
+		args1[i] = id
+	}
+
+	type CommentCountResult struct {
+		PostID int `db:"post_id"`
+		Count  int `db:"count"`
+	}
+	var countResults []CommentCountResult
+	query1 := "SELECT post_id, COUNT(*) as count FROM comments WHERE post_id IN (" + strings.Join(placeholders1, ",") + ") GROUP BY post_id"
+	err := db.Select(&countResults, query1, args1...)
+	if err != nil {
+		return nil, err
+	}
+	for _, result := range countResults {
+		commentCounts[result.PostID] = result.Count
+	}
+
+	// 2. 一括でコメント一覧とユーザー情報を取得（JOIN使用）
+	var query2 string
+	if allComments {
+		query2 = `
+			SELECT c.*, u.id as user_id, u.account_name, u.passhash, u.authority, u.del_flg, u.created_at as user_created_at
+			FROM comments c
+			JOIN users u ON c.user_id = u.id
+			WHERE c.post_id IN (` + strings.Join(placeholders1, ",") + `)
+			ORDER BY c.post_id, c.created_at DESC`
+	} else {
+		query2 = `
+			SELECT c.*, u.id as user_id, u.account_name, u.passhash, u.authority, u.del_flg, u.created_at as user_created_at
+			FROM (
+				SELECT *, ROW_NUMBER() OVER (PARTITION BY post_id ORDER BY created_at DESC) as rn
+				FROM comments
+				WHERE post_id IN (` + strings.Join(placeholders1, ",") + `)
+			) c
+			JOIN users u ON c.user_id = u.id
+			WHERE c.rn <= 3
+			ORDER BY c.post_id, c.created_at DESC`
+	}
+
+	type CommentWithUser struct {
+		ID              int       `db:"id"`
+		PostID          int       `db:"post_id"`
+		CommentUserID   int       `db:"user_id"`
+		CommentText     string    `db:"comment"`
+		CommentCreatedAt time.Time `db:"created_at"`
+		UserID          int       `db:"user_id"`
+		AccountName     string    `db:"account_name"`
+		Passhash        string    `db:"passhash"`
+		Authority       int       `db:"authority"`
+		DelFlg          int       `db:"del_flg"`
+		UserCreatedAt   time.Time `db:"user_created_at"`
+	}
+
+	var commentResults []CommentWithUser
+	err = db.Select(&commentResults, query2, args1...)
+	if err != nil {
+		return nil, err
+	}
+
+	// コメントをpost_idでグループ化
+	postComments := make(map[int][]Comment)
+	for _, result := range commentResults {
+		comment := Comment{
+			ID:        result.ID,
+			PostID:    result.PostID,
+			UserID:    result.CommentUserID,
+			Comment:   result.CommentText,
+			CreatedAt: result.CommentCreatedAt,
+			User: User{
+				ID:          result.UserID,
+				AccountName: result.AccountName,
+				Passhash:    result.Passhash,
+				Authority:   result.Authority,
+				DelFlg:      result.DelFlg,
+				CreatedAt:   result.UserCreatedAt,
+			},
+		}
+		postComments[result.PostID] = append(postComments[result.PostID], comment)
+	}
+
+	// 3. 一括で投稿者情報を取得
+	userIDs := make([]int, len(results))
+	for i, p := range results {
+		userIDs[i] = p.UserID
+	}
+
+	placeholders3 := make([]string, len(userIDs))
+	args3 := make([]interface{}, len(userIDs))
+	for i, id := range userIDs {
+		placeholders3[i] = "?"
+		args3[i] = id
+	}
+
+	var users []User
+	query3 := "SELECT * FROM users WHERE id IN (" + strings.Join(placeholders3, ",") + ")"
+	err = db.Select(&users, query3, args3...)
+	if err != nil {
+		return nil, err
+	}
+
+	userMap := make(map[int]User)
+	for _, user := range users {
+		userMap[user.ID] = user
+	}
+
+	// 4. 結果をアセンブル
+	validPosts := []Post{}
+	for i := range posts {
+		p := &posts[i]
+
+		// コメント数設定
+		if count, exists := commentCounts[p.ID]; exists {
+			p.CommentCount = count
 		}
 
-		var comments []Comment
-
-		// キャッシュからコメント一覧を取得
-		commentsCacheKey := fmt.Sprintf("comments:%d:%t", p.ID, allComments)
-		item, err = memcacheClient.Get(commentsCacheKey)
-		if err == nil {
-			// キャッシュヒット
-			if err := json.Unmarshal(item.Value, &comments); err != nil {
-				// キャッシュが壊れている場合はDBから取得
-				query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC"
-				if !allComments {
-					query += " LIMIT 3"
-				}
-				err = db.Select(&comments, query, p.ID)
-				if err != nil {
-					return nil, err
-				}
+		// コメント一覧設定（逆順にする）
+		if comments, exists := postComments[p.ID]; exists {
+			// reverse
+			for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
+				comments[i], comments[j] = comments[j], comments[i]
 			}
-		} else {
-			// キャッシュミス、DBから取得
-			query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC"
-			if !allComments {
-				query += " LIMIT 3"
-			}
-			err = db.Select(&comments, query, p.ID)
-			if err != nil {
-				return nil, err
-			}
-
-			// キャッシュに保存
-			if commentsJSON, err := json.Marshal(comments); err == nil {
-				memcacheClient.Set(&memcache.Item{
-					Key:        commentsCacheKey,
-					Value:      commentsJSON,
-					Expiration: 180, // 3分
-				})
-			}
+			p.Comments = comments
 		}
 
-		for i := 0; i < len(comments); i++ {
-			// キャッシュからユーザー情報を取得
-			cacheKey := fmt.Sprintf("user:%d", comments[i].UserID)
-			item, err := memcacheClient.Get(cacheKey)
-			if err == nil {
-				// キャッシュヒット
-				if err := json.Unmarshal(item.Value, &comments[i].User); err == nil {
-					continue
-				}
-			}
-
-			// キャッシュミス、DBから取得
-			err = db.Get(&comments[i].User, "SELECT * FROM `users` WHERE `id` = ?", comments[i].UserID)
-			if err != nil {
-				return nil, err
-			}
-
-			// キャッシュに保存
-			if userJSON, err := json.Marshal(comments[i].User); err == nil {
-				memcacheClient.Set(&memcache.Item{
-					Key:        cacheKey,
-					Value:      userJSON,
-					Expiration: 300, // 5分
-				})
-			}
-		}
-
-		// reverse
-		for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
-			comments[i], comments[j] = comments[j], comments[i]
-		}
-
-		p.Comments = comments
-
-		// キャッシュから投稿者情報を取得
-		cacheKey = fmt.Sprintf("user:%d", p.UserID)
-		item, err = memcacheClient.Get(cacheKey)
-		if err == nil {
-			// キャッシュヒット
-			if err := json.Unmarshal(item.Value, &p.User); err != nil {
-				// キャッシュミス、DBから取得
-				err = db.Get(&p.User, "SELECT * FROM `users` WHERE `id` = ?", p.UserID)
-				if err != nil {
-					return nil, err
-				}
-			}
-		} else {
-			// キャッシュミス、DBから取得
-			err = db.Get(&p.User, "SELECT * FROM `users` WHERE `id` = ?", p.UserID)
-			if err != nil {
-				return nil, err
-			}
-
-			// キャッシュに保存
-			if userJSON, err := json.Marshal(p.User); err == nil {
-				memcacheClient.Set(&memcache.Item{
-					Key:        cacheKey,
-					Value:      userJSON,
-					Expiration: 300, // 5分
-				})
-			}
+		// 投稿者情報設定
+		if user, exists := userMap[p.UserID]; exists {
+			p.User = user
 		}
 
 		p.CSRFToken = csrfToken
 
 		if p.User.DelFlg == 0 {
-			posts = append(posts, p)
+			validPosts = append(validPosts, *p)
 		}
-		if len(posts) >= postsPerPage {
+		if len(validPosts) >= postsPerPage {
 			break
 		}
 	}
 
-	return posts, nil
+	return validPosts, nil
 }
 
 func imageURL(p Post) string {
