@@ -300,8 +300,8 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 		p.Comments = comments
 
 		// キャッシュから投稿者情報を取得
-		cacheKey := fmt.Sprintf("user:%d", p.UserID)
-		item, err := memcacheClient.Get(cacheKey)
+		cacheKey = fmt.Sprintf("user:%d", p.UserID)
+		item, err = memcacheClient.Get(cacheKey)
 		if err == nil {
 			// キャッシュヒット
 			if err := json.Unmarshal(item.Value, &p.User); err != nil {
