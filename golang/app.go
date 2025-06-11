@@ -493,123 +493,111 @@ func getLogout(w http.ResponseWriter, r *http.Request) {
 }
 
 func getIndex(w http.ResponseWriter, r *http.Request) {
-	me := getSessionUser(r)
+    me := getSessionUser(r)
 
-	results := []Post{}
+    results := []Post{}
 
-	err := db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC")
-	if err != nil {
-		log.Print(err)
-		return
-	}
+    // [수정] LIMIT을 추가하여 필요한 만큼만 DB에서 가져옵니다.
+    err := db.Select(&results,
+        "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC LIMIT ?",
+        postsPerPage)
 
-	posts, err := makePosts(results, getCSRFToken(r), false)
-	if err != nil {
-		log.Print(err)
-		return
-	}
+    if err != nil {
+        log.Print(err)
+        return
+    }
 
-	fmap := template.FuncMap{
-		"imageURL": imageURL,
-	}
+    // 이전에 제안드렸던 최적화된 makePosts 함수를 호출합니다.
+    posts, err := makePosts(results, getCSRFToken(r), false)
+    if err != nil {
+        log.Print(err)
+        return
+    }
 
-	template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
-		getTemplPath("layout.html"),
-		getTemplPath("index.html"),
-		getTemplPath("posts.html"),
-		getTemplPath("post.html"),
-	)).Execute(w, struct {
-		Posts     []Post
-		Me        User
-		CSRFToken string
-		Flash     string
-	}{posts, me, getCSRFToken(r), getFlash(w, r, "notice")})
+    fmap := template.FuncMap{
+        "imageURL": imageURL,
+    }
+
+    // template.Must는 main 함수에서 미리 처리하는 것이 좋습니다 (템플릿 캐싱).
+    template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
+        getTemplPath("layout.html"),
+        getTemplPath("index.html"),
+        getTemplPath("posts.html"),
+        getTemplPath("post.html"),
+    )).Execute(w, struct {
+        Posts     []Post
+        Me        User
+        CSRFToken string
+        Flash     string
+    }{posts, me, getCSRFToken(r), getFlash(w, r, "notice")})
 }
 
 func getAccountName(w http.ResponseWriter, r *http.Request) {
-	accountName := r.PathValue("accountName")
-	user := User{}
+    accountName := r.PathValue("accountName")
+    
+    // 1. 사용자 정보를 가져옵니다.
+    user := User{}
+    err := db.Get(&user, "SELECT * FROM `users` WHERE `account_name` = ? AND `del_flg` = 0", accountName)
+    if err != nil {
+        // 사용자가 없는 경우 404 처리
+        http.NotFound(w, r)
+        return
+    }
 
-	err := db.Get(&user, "SELECT * FROM `users` WHERE `account_name` = ? AND `del_flg` = 0", accountName)
-	if err != nil {
-		log.Print(err)
-		return
-	}
+    // 2. 해당 사용자의 게시물을 LIMIT을 걸어 가져옵니다.
+    results := []Post{}
+    err = db.Select(&results,
+        "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC LIMIT ?",
+        user.ID, postsPerPage)
+    if err != nil {
+        log.Print(err)
+        http.Error(w, "Internal Server Error", 500)
+        return
+    }
+    
+    // 3. 최적화된 makePosts를 호출합니다.
+    posts, err := makePosts(results, getCSRFToken(r), false)
+    if err != nil {
+        log.Print(err)
+        http.Error(w, "Internal Server Error", 500)
+        return
+    }
 
-	if user.ID == 0 {
-		w.WriteHeader(http.StatusNotFound)
-		return
-	}
+    // 4. 여러 개의 COUNT 쿼리를 하나로 통합하여 실행합니다.
+    var postCount, commentCount, commentedCount int
+    query := `
+        SELECT
+            (SELECT COUNT(*) FROM posts WHERE user_id = ?) AS post_count,
+            (SELECT COUNT(*) FROM comments WHERE user_id = ?) AS comment_count,
+            (SELECT COUNT(*) FROM comments WHERE post_id IN (SELECT id FROM posts WHERE user_id = ?)) AS commented_count
+    `
+    row := db.QueryRow(query, user.ID, user.ID, user.ID)
+    err = row.Scan(&postCount, &commentCount, &commentedCount)
+    if err != nil {
+        log.Print(err)
+        http.Error(w, "Internal Server Error", 500)
+        return
+    }
 
-	results := []Post{}
+    me := getSessionUser(r)
 
-	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC", user.ID)
-	if err != nil {
-		log.Print(err)
-		return
-	}
+    fmap := template.FuncMap{
+        "imageURL": imageURL,
+    }
 
-	posts, err := makePosts(results, getCSRFToken(r), false)
-	if err != nil {
-		log.Print(err)
-		return
-	}
-
-	commentCount := 0
-	err = db.Get(&commentCount, "SELECT COUNT(*) AS count FROM `comments` WHERE `user_id` = ?", user.ID)
-	if err != nil {
-		log.Print(err)
-		return
-	}
-
-	postIDs := []int{}
-	err = db.Select(&postIDs, "SELECT `id` FROM `posts` WHERE `user_id` = ?", user.ID)
-	if err != nil {
-		log.Print(err)
-		return
-	}
-	postCount := len(postIDs)
-
-	commentedCount := 0
-	if postCount > 0 {
-		s := []string{}
-		for range postIDs {
-			s = append(s, "?")
-		}
-		placeholder := strings.Join(s, ", ")
-
-		// convert []int -> []interface{}
-		args := make([]interface{}, len(postIDs))
-		for i, v := range postIDs {
-			args[i] = v
-		}
-
-		err = db.Get(&commentedCount, "SELECT COUNT(*) AS count FROM `comments` WHERE `post_id` IN ("+placeholder+")", args...)
-		if err != nil {
-			log.Print(err)
-			return
-		}
-	}
-
-	me := getSessionUser(r)
-
-	fmap := template.FuncMap{
-		"imageURL": imageURL,
-	}
-
-	template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
-		getTemplPath("layout.html"),
-		getTemplPath("user.html"),
-		getTemplPath("posts.html"),
-		getTemplPath("post.html"),
-	)).Execute(w, struct {
-		Posts          []Post
-		User           User
-		PostCount      int
-		CommentCount   int
-		CommentedCount int
-		Me             User
-	}{posts, user, postCount, commentCount, commentedCount, me})
+    template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
+        getTemplPath("layout.html"),
+        getTemplPath("user.html"),
+        getTemplPath("posts.html"),
+        getTemplPath("post.html"),
+    )).Execute(w, struct {
+        Posts          []Post
+        User           User
+        PostCount      int
+        CommentCount   int
+        CommentedCount int
+        Me             User
+    }{posts, user, postCount, commentCount, commentedCount, me})
 }
 
 func getPosts(w http.ResponseWriter, r *http.Request) {
