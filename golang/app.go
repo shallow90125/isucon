@@ -1,11 +1,8 @@
 package main
 
 import (
-	"crypto/rand"
-	"crypto/sha512"
-	"database/sql"
-	"encoding/gob"
-	"encoding/hex"
+	crand "crypto/rand"
+	"encoding/json"
 	"fmt"
 	"html/template"
 	"io"
@@ -13,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path"
 	"regexp"
 	"strconv"
@@ -28,9 +26,9 @@ import (
 )
 
 var (
-	db        *sqlx.DB
-	store     *gsm.MemcacheStore
-	templates *template.Template // ★★★ 템플릿 캐싱을 위한 전역 변수
+	db    *sqlx.DB
+	store *gsm.MemcacheStore
+	memcacheClient *memcache.Client
 )
 
 const (
@@ -75,19 +73,9 @@ func init() {
 	if memdAddr == "" {
 		memdAddr = "localhost:11211"
 	}
-	memcacheClient := memcache.New(memdAddr)
+	memcacheClient = memcache.New(memdAddr)
 	store = gsm.NewMemcacheStore(memcacheClient, "iscogram_", []byte("sendagaya"))
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
-
-	// ★★★ 세션에 User 구조체를 저장하기 위해 gob에 등록
-	gob.Register(User{})
-
-	// ★★★ 템플릿 함수맵 등록
-	fmap := template.FuncMap{
-		"imageURL": imageURL,
-	}
-	// ★★★ 애플리케이션 시작 시 모든 템플릿을 미리 파싱하여 캐싱
-	templates = template.Must(template.New("layout.html").Funcs(fmap).ParseGlob(getTemplPath("*.html")))
 }
 
 func dbInitialize() {
@@ -102,6 +90,8 @@ func dbInitialize() {
 	for _, sql := range sqls {
 		db.Exec(sql)
 	}
+	// DB 초기화 시 모든 캐시를 비워주는 것이 좋습니다.
+	memcacheClient.FlushAll()
 }
 
 func tryLogin(accountName, password string) *User {
@@ -123,11 +113,22 @@ func validateUser(accountName, password string) bool {
 		regexp.MustCompile(`\A[0-9a-zA-Z_]{6,}\z`).MatchString(password)
 }
 
-// ★★★ [개선] 외부 프로세스 호출 제거. Go 네이티브 crypto 라이브러리 사용
+// 今回のGo実装では言語側のエスケープの仕組みが使えないのでOSコマンドインジェクション対策できない
+// 取り急ぎPHPのescapeshellarg関数を参考に自前で実装
+// cf: http://jp2.php.net/manual/ja/function.escapeshellarg.php
+func escapeshellarg(arg string) string {
+	return "'" + strings.Replace(arg, "'", "'\\''", -1) + "'"
+}
+
 func digest(src string) string {
-	hasher := sha512.New()
-	hasher.Write([]byte(src))
-	return hex.EncodeToString(hasher.Sum(nil))
+	// opensslのバージョンによっては (stdin)= というのがつくので取る
+	out, err := exec.Command("/bin/bash", "-c", `printf "%s" `+escapeshellarg(src)+` | openssl dgst -sha512 | sed 's/^.*= //'`).Output()
+	if err != nil {
+		log.Print(err)
+		return ""
+	}
+
+	return strings.TrimSuffix(string(out), "\n")
 }
 
 func calculateSalt(accountName string) string {
@@ -140,20 +141,44 @@ func calculatePasshash(accountName, password string) string {
 
 func getSession(r *http.Request) *sessions.Session {
 	session, _ := store.Get(r, "isuconp-go.session")
+
 	return session
 }
 
-// ★★★ [개선] DB 조회 없이 세션에서 직접 사용자 정보 반환
 func getSessionUser(r *http.Request) User {
 	session := getSession(r)
-	val := session.Values["user"]
-	if val == nil {
+	uid, ok := session.Values["user_id"]
+	if !ok || uid == nil {
 		return User{}
 	}
-	u, ok := val.(User)
-	if !ok {
+
+	u := User{}
+
+	// キャッシュから取得を試行
+	cacheKey := fmt.Sprintf("user:%v", uid)
+	item, err := memcacheClient.Get(cacheKey)
+	if err == nil {
+		// キャッシュヒット
+		if err := json.Unmarshal(item.Value, &u); err == nil {
+			return u
+		}
+	}
+
+	// キャッシュミス、DBから取得
+	err = db.Get(&u, "SELECT * FROM `users` WHERE `id` = ?", uid)
+	if err != nil {
 		return User{}
 	}
+
+	// キャッシュに保存
+	if userJSON, err := json.Marshal(u); err == nil {
+		memcacheClient.Set(&memcache.Item{
+			Key:        cacheKey,
+			Value:      userJSON,
+			Expiration: 300, // 5分
+		})
+	}
+
 	return u
 }
 
@@ -170,82 +195,197 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 	}
 }
 
-// ★★★ [개선] N+1 쿼리 문제를 해결한 새로운 makePosts 함수
 func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, error) {
-	if len(results) == 0 {
-		return []Post{}, nil
-	}
+	var posts []Post
 
-	// 1. 필요한 ID들을 수집
-	postIDs := make([]int, 0, len(results))
-	userIDs := make(map[int]struct{})
+	// 모든 관련 user_id와 post_id를 수집합니다.
+	userIDSet := make(map[int]struct{})
+	postIDSet := make(map[int]struct{})
 	for _, p := range results {
-		postIDs = append(postIDs, p.ID)
-		userIDs[p.UserID] = struct{}{}
+		userIDSet[p.UserID] = struct{}{}
+		postIDSet[p.ID] = struct{}{}
 	}
 
-	// 2. IN 절을 사용해 댓글들을 한 번에 조회
-	query, args, err := sqlx.In("SELECT * FROM `comments` WHERE `post_id` IN (?) ORDER BY `created_at` ASC", postIDs)
-	if err != nil {
-		return nil, err
-	}
-	var comments []Comment
-	err = db.Select(&comments, query, args...)
-	if err != nil {
-		return nil, err
-	}
+	// 댓글 사용자 ID도 수집해야 합니다.
+	var allCommentsData []Comment
+	if len(postIDSet) > 0 {
+		postIDs := make([]interface{}, 0, len(postIDSet))
+		for id := range postIDSet {
+			postIDs = append(postIDs, id)
+		}
+		placeholder := strings.Join(strings.Split(strings.Repeat("?", len(postIDs)), ""), ", ")
 
-	// 댓글 작성자 ID 수집
-	for _, c := range comments {
-		userIDs[c.UserID] = struct{}{}
-	}
+		// 모든 관련 댓글을 가져옵니다 (배치 조회).
+		commentsQuery := "SELECT * FROM `comments` WHERE `post_id` IN (" + placeholder + ") ORDER BY `created_at` DESC"
+		err := db.Select(&allCommentsData, commentsQuery, postIDs...)
+		if err != nil {
+			return nil, err
+		}
 
-	// 3. IN 절을 사용해 필요한 모든 사용자 정보를 한 번에 조회
-	userIDSlice := make([]int, 0, len(userIDs))
-	for id := range userIDs {
-		userIDSlice = append(userIDSlice, id)
-	}
-	userQuery, userArgs, err := sqlx.In("SELECT * FROM `users` WHERE `id` IN (?)", userIDSlice)
-	if err != nil {
-		return nil, err
-	}
-	var users []User
-	err = db.Select(&users, userQuery, userArgs...)
-	if err != nil {
-		return nil, err
-	}
-
-	// 4. 빠른 조회를 위해 사용자 정보와 댓글을 맵으로 변환
-	userMap := make(map[int]User, len(users))
-	for _, u := range users {
-		userMap[u.ID] = u
-	}
-
-	commentMap := make(map[int][]Comment, len(comments))
-	for _, c := range comments {
-		if user, ok := userMap[c.UserID]; ok {
-			c.User = user
-			commentMap[c.PostID] = append(commentMap[c.PostID], c)
+		for _, c := range allCommentsData {
+			userIDSet[c.UserID] = struct{}{}
 		}
 	}
 
-	// 5. 최종 데이터 조합
-	posts := make([]Post, 0, len(results))
-	for _, p := range results {
-		// 사용자 정보와 댓글 정보 할당
-		if user, ok := userMap[p.UserID]; ok && user.DelFlg == 0 {
-			p.User = user
-			p.Comments = commentMap[p.ID]
-			p.CommentCount = len(p.Comments)
-			p.CSRFToken = csrfToken
+	// 모든 사용자 정보를 배치로 가져옵니다.
+	userMap := make(map[int]User)
+	if len(userIDSet) > 0 {
+		userIDs := make([]interface{}, 0, len(userIDSet))
+		for id := range userIDSet {
+			userIDs = append(userIDs, id)
+		}
+		
+		// Memcache에서 사용자 정보를 배치로 가져오기 시도
+		userCacheKeys := make([]string, 0, len(userIDs))
+		for _, uid := range userIDs {
+			userCacheKeys = append(userCacheKeys, fmt.Sprintf("user:%v", uid))
+		}
+		cachedItems, err := memcacheClient.GetMulti(userCacheKeys)
+		if err != nil && err != memcache.ErrCacheMiss {
+			log.Printf("Error getting multi user cache: %v", err)
+		}
 
-			// allComments가 false일 때 최근 3개 댓글만 표시
-			if !allComments && len(p.Comments) > 3 {
-				p.Comments = p.Comments[len(p.Comments)-3:]
+		dbUserIDs := make([]interface{}, 0)
+		for _, uid := range userIDs {
+			uIDInt := uid.(int)
+			cacheKey := fmt.Sprintf("user:%d", uIDInt)
+			if item, ok := cachedItems[cacheKey]; ok {
+				var u User
+				if err := json.Unmarshal(item.Value, &u); err == nil {
+					userMap[u.ID] = u
+				} else {
+					log.Printf("Error unmarshaling cached user %d: %v", uIDInt, err)
+					dbUserIDs = append(dbUserIDs, uid) // 캐시 손상 시 DB에서 다시 가져오기
+				}
+			} else {
+				dbUserIDs = append(dbUserIDs, uid)
 			}
+		}
+
+		if len(dbUserIDs) > 0 {
+			dbPlaceholder := strings.Join(strings.Split(strings.Repeat("?", len(dbUserIDs)), ""), ", ")
+			var users []User
+			err = db.Select(&users, "SELECT * FROM `users` WHERE `id` IN ("+dbPlaceholder+")", dbUserIDs...)
+			if err != nil {
+				return nil, err
+			}
+			for _, u := range users {
+				userMap[u.ID] = u
+				// DB에서 가져온 사용자 정보를 캐시에 저장
+				if userJSON, err := json.Marshal(u); err == nil {
+					memcacheClient.Set(&memcache.Item{
+						Key:        fmt.Sprintf("user:%d", u.ID),
+						Value:      userJSON,
+						Expiration: 300, // 5분
+					})
+				}
+			}
+		}
+	}
+
+	// 댓글을 postID별로 그룹화하고 사용자 정보를 연결합니다.
+	commentsByPostID := make(map[int][]Comment)
+	for _, c := range allCommentsData {
+		if u, ok := userMap[c.UserID]; ok {
+			c.User = u
+		} else {
+			c.User = User{} // 사용자 정보가 없는 경우 (예: 삭제된 사용자)
+		}
+		commentsByPostID[c.PostID] = append(commentsByPostID[c.PostID], c)
+	}
+
+	// 모든 comment_count를 배치로 가져옵니다.
+	commentCounts := make(map[int]int)
+	if len(postIDSet) > 0 {
+		postIDs := make([]interface{}, 0, len(postIDSet))
+		for id := range postIDSet {
+			postIDs = append(postIDs, id)
+		}
+		placeholder := strings.Join(strings.Split(strings.Repeat("?", len(postIDs)), ""), ", ")
+
+		// 캐시에서 comment count를 배치로 가져오기 시도
+		countCacheKeys := make([]string, 0, len(postIDs))
+		for _, pid := range postIDs {
+			countCacheKeys = append(countCacheKeys, fmt.Sprintf("comment_count:%v", pid))
+		}
+		cachedCounts, err := memcacheClient.GetMulti(countCacheKeys)
+		if err != nil && err != memcache.ErrCacheMiss {
+			log.Printf("Error getting multi comment count cache: %v", err)
+		}
+
+		dbPostIDsForCounts := make([]interface{}, 0)
+		for _, pid := range postIDs {
+			pIDInt := pid.(int)
+			cacheKey := fmt.Sprintf("comment_count:%d", pIDInt)
+			if item, ok := cachedCounts[cacheKey]; ok {
+				var count int
+				if err := json.Unmarshal(item.Value, &count); err == nil {
+					commentCounts[pIDInt] = count
+				} else {
+					log.Printf("Error unmarshaling cached comment count %d: %v", pIDInt, err)
+					dbPostIDsForCounts = append(dbPostIDsForCounts, pid)
+				}
+			} else {
+				dbPostIDsForCounts = append(dbPostIDsForCounts, pid)
+			}
+		}
+
+		if len(dbPostIDsForCounts) > 0 {
+			dbPlaceholder := strings.Join(strings.Split(strings.Repeat("?", len(dbPostIDsForCounts)), ""), ", ")
+			var dbCounts []struct {
+				PostID int `db:"post_id"`
+				Count  int `db:"count"`
+			}
+			err = db.Select(&dbCounts, "SELECT `post_id`, COUNT(*) AS `count` FROM `comments` WHERE `post_id` IN ("+dbPlaceholder+") GROUP BY `post_id`", dbPostIDsForCounts...)
+			if err != nil {
+				return nil, err
+			}
+			for _, cc := range dbCounts {
+				commentCounts[cc.PostID] = cc.Count
+				// DB에서 가져온 댓글 수를 캐시에 저장
+				if countJSON, err := json.Marshal(cc.Count); err == nil {
+					memcacheClient.Set(&memcache.Item{
+						Key:        fmt.Sprintf("comment_count:%d", cc.PostID),
+						Value:      countJSON,
+						Expiration: 180, // 3분
+					})
+				}
+			}
+		}
+	}
+
+	for _, p := range results {
+		p.CommentCount = commentCounts[p.ID] // 미리 가져온 댓글 수 할당
+
+		// 댓글 정보를 할당하고 사용자 정보 연결
+		comments := commentsByPostID[p.ID]
+		var finalComments []Comment
+		if !allComments && len(comments) > 3 {
+			// DB에서 DESC로 가져왔으므로, slice 마지막 3개가 최신 댓글
+			finalComments = comments[len(comments)-3:]
+		} else {
+			finalComments = comments
+		}
+
+		// reverse
+		for i, j := 0, len(finalComments)-1; i < j; i, j = i+1, j-1 {
+			finalComments[i], finalComments[j] = finalComments[j], finalComments[i]
+		}
+		p.Comments = finalComments
+
+		// 게시글 작성자 정보 연결
+		if u, ok := userMap[p.UserID]; ok {
+			p.User = u
+		} else {
+			p.User = User{} // 게시글 작성자 정보가 없는 경우
+		}
+
+		p.CSRFToken = csrfToken
+
+		// del_flg가 0인 사용자만 게시글에 포함 (기존 로직 유지)
+		if p.User.DelFlg == 0 {
 			posts = append(posts, p)
 		}
-
 		if len(posts) >= postsPerPage {
 			break
 		}
@@ -253,7 +393,6 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 
 	return posts, nil
 }
-
 
 func imageURL(p Post) string {
 	ext := ""
@@ -282,11 +421,11 @@ func getCSRFToken(r *http.Request) string {
 }
 
 func secureRandomStr(b int) string {
-    k := make([]byte, b)
-    if _, err := rand.Read(k); err != nil { // Use crypto/rand.Read()
-        panic(err)
-    }
-    return fmt.Sprintf("%x", k)
+	k := make([]byte, b)
+	if _, err := crand.Read(k); err != nil {
+		panic(err)
+	}
+	return fmt.Sprintf("%x", k)
 }
 
 func getTemplPath(filename string) string {
@@ -305,8 +444,11 @@ func getLogin(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusFound)
 		return
 	}
-	// ★★★ [개선] 캐싱된 템플릿 사용
-	templates.ExecuteTemplate(w, "login.html", struct {
+
+	template.Must(template.ParseFiles(
+		getTemplPath("layout.html"),
+		getTemplPath("login.html")),
+	).Execute(w, struct {
 		Me    User
 		Flash string
 	}{me, getFlash(w, r, "notice")})
@@ -322,16 +464,14 @@ func postLogin(w http.ResponseWriter, r *http.Request) {
 
 	if u != nil {
 		session := getSession(r)
-		// ★★★ [개선] 세션에 User 객체 저장
-		session.Values["user"] = *u
-		session.Values["user_id"] = u.ID // 이전 버전 호환성을 위해 유지 가능
+		session.Values["user_id"] = u.ID
 		session.Values["csrf_token"] = secureRandomStr(16)
 		session.Save(r, w)
 
 		http.Redirect(w, r, "/", http.StatusFound)
 	} else {
 		session := getSession(r)
-		session.Values["notice"] = "계정명 또는 비밀번호가 틀렸습니다"
+		session.Values["notice"] = "アカウント名かパスワードが間違っています"
 		session.Save(r, w)
 
 		http.Redirect(w, r, "/login", http.StatusFound)
@@ -343,8 +483,11 @@ func getRegister(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusFound)
 		return
 	}
-	// ★★★ [개선] 캐싱된 템플릿 사용
-	templates.ExecuteTemplate(w, "register.html", struct {
+
+	template.Must(template.ParseFiles(
+		getTemplPath("layout.html"),
+		getTemplPath("register.html")),
+	).Execute(w, struct {
 		Me    User
 		Flash string
 	}{User{}, getFlash(w, r, "notice")})
@@ -361,25 +504,22 @@ func postRegister(w http.ResponseWriter, r *http.Request) {
 	validated := validateUser(accountName, password)
 	if !validated {
 		session := getSession(r)
-		session.Values["notice"] = "계정명은 3자 이상, 비밀번호는 6자 이상이어야 합니다"
+		session.Values["notice"] = "アカウント名は3文字以上、パスワードは6文字以上である必要があります"
 		session.Save(r, w)
 
 		http.Redirect(w, r, "/register", http.StatusFound)
 		return
 	}
 
-	var exists int
-	err := db.Get(&exists, "SELECT 1 FROM users WHERE `account_name` = ?", accountName)
-	if err != nil && err != sql.ErrNoRows {
-		log.Print(err)
-		http.Error(w, "DB Error", http.StatusInternalServerError)
-		return
-	}
+	exists := 0
+	// ユーザーが存在しない場合はエラーになるのでエラーチェックはしない
+	db.Get(&exists, "SELECT 1 FROM users WHERE `account_name` = ?", accountName)
 
 	if exists == 1 {
 		session := getSession(r)
-		session.Values["notice"] = "이미 사용중인 계정명입니다"
+		session.Values["notice"] = "アカウント名がすでに使われています"
 		session.Save(r, w)
+
 		http.Redirect(w, r, "/register", http.StatusFound)
 		return
 	}
@@ -391,22 +531,12 @@ func postRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	session := getSession(r)
 	uid, err := result.LastInsertId()
 	if err != nil {
 		log.Print(err)
 		return
 	}
-
-	// ★★★ [개선] 세션에 저장할 사용자 정보 조회 및 저장
-	var u User
-	err = db.Get(&u, "SELECT * FROM users WHERE id = ?", uid)
-	if err != nil {
-		log.Print(err)
-		return
-	}
-
-	session := getSession(r)
-	session.Values["user"] = u
 	session.Values["user_id"] = uid
 	session.Values["csrf_token"] = secureRandomStr(16)
 	session.Save(r, w)
@@ -416,7 +546,6 @@ func postRegister(w http.ResponseWriter, r *http.Request) {
 
 func getLogout(w http.ResponseWriter, r *http.Request) {
 	session := getSession(r)
-	delete(session.Values, "user")
 	delete(session.Values, "user_id")
 	session.Options = &sessions.Options{MaxAge: -1}
 	session.Save(r, w)
@@ -425,47 +554,12 @@ func getLogout(w http.ResponseWriter, r *http.Request) {
 }
 
 func getIndex(w http.ResponseWriter, r *http.Request) {
-	me := getSessionUser(r)
-
-	results := []Post{}
-	err := db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC")
-	if err != nil {
-		log.Print(err)
-		return
-	}
-
-	posts, err := makePosts(results, getCSRFToken(r), false)
-	if err != nil {
-		log.Print(err)
-		return
-	}
-
-	// ★★★ [개선] 캐싱된 템플릿 사용
-	templates.ExecuteTemplate(w, "index.html", struct {
-		Posts     []Post
-		Me        User
-		CSRFToken string
-		Flash     string
-	}{posts, me, getCSRFToken(r), getFlash(w, r, "notice")})
-}
-
-func getAccountName(w http.ResponseWriter, r *http.Request) {
-    accountName := chi.URLParam(r, "accountName") // chi v5
-    var user User
-
-    err := db.Get(&user, "SELECT * FROM `users` WHERE `account_name` = ? AND `del_flg` = 0", accountName)
-    if err == sql.ErrNoRows {
-        w.WriteHeader(http.StatusNotFound)
-        return
-    }
-    if err != nil {
-        log.Print(err)
-        http.Error(w, "Not Found", http.StatusNotFound)
-        return
-    }
+    me := getSessionUser(r)
 
     results := []Post{}
-    err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC", user.ID)
+
+    // LIMIT 절을 추가하여 postsPerPage 만큼만 DB에서 가져옴
+    err := db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC LIMIT ?", postsPerPage)
     if err != nil {
         log.Print(err)
         return
@@ -477,65 +571,40 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    // ★★★ [개선] 쿼리 효율화
-    var postCount int
-    err = db.Get(&postCount, "SELECT COUNT(*) FROM `posts` WHERE `user_id` = ?", user.ID)
-    if err != nil {
-        log.Print(err)
-        return
+    fmap := template.FuncMap{
+        "imageURL": imageURL,
     }
 
-    var commentCount int
-    err = db.Get(&commentCount, "SELECT COUNT(*) FROM `comments` WHERE `user_id` = ?", user.ID)
-    if err != nil {
-        log.Print(err)
-        return
-    }
-
-    var commentedCount int
-    err = db.Get(&commentedCount, "SELECT COUNT(*) FROM `comments` WHERE `post_id` IN (SELECT `id` FROM `posts` WHERE `user_id` = ?)", user.ID)
-    if err != nil && err != sql.ErrNoRows {
-        log.Print(err)
-        return
-    }
-
-    me := getSessionUser(r)
-
-    // ★★★ [개선] 캐싱된 템플릿 사용
-    templates.ExecuteTemplate(w, "user.html", struct {
-        Posts          []Post
-        User           User
-        PostCount      int
-        CommentCount   int
-        CommentedCount int
-        Me             User
-    }{posts, user, postCount, commentCount, commentedCount, me})
+    template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
+        getTemplPath("layout.html"),
+        getTemplPath("index.html"),
+        getTemplPath("posts.html"),
+        getTemplPath("post.html"),
+    )).Execute(w, struct {
+        Posts     []Post
+        Me        User
+        CSRFToken string
+        Flash     string
+    }{posts, me, getCSRFToken(r), getFlash(w, r, "notice")})
 }
+func getAccountName(w http.ResponseWriter, r *http.Request) {
+	accountName := r.PathValue("accountName")
+	user := User{}
 
-// ... 이하 다른 핸들러 함수들도 유사하게 캐싱된 템플릿을 사용하도록 수정합니다 ...
-// (postIndex, getImage, postComment, getAdminBanned, postAdminBanned 등은 템플릿을 직접 사용하지 않으므로 변경 불필요)
-// getPosts, getPostsID, getAdminBanned는 ExecuteTemplate을 사용하도록 수정 필요
-
-func getPosts(w http.ResponseWriter, r *http.Request) {
-	m, err := url.ParseQuery(r.URL.RawQuery)
+	err := db.Get(&user, "SELECT * FROM `users` WHERE `account_name` = ? AND `del_flg` = 0", accountName)
 	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
 		log.Print(err)
 		return
 	}
-	maxCreatedAt := m.Get("max_created_at")
-	if maxCreatedAt == "" {
-		return
-	}
 
-	t, err := time.Parse(ISO8601Format, maxCreatedAt)
-	if err != nil {
-		log.Print(err)
+	if user.ID == 0 {
+		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 
 	results := []Post{}
-	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC", t.Format(time.RFC3339Nano))
+
+	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC", user.ID)
 	if err != nil {
 		log.Print(err)
 		return
@@ -547,39 +616,92 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if len(posts) == 0 {
-		w.WriteHeader(http.StatusNotFound)
+	commentCount := 0
+	err = db.Get(&commentCount, "SELECT COUNT(*) AS count FROM `comments` WHERE `user_id` = ?", user.ID)
+	if err != nil {
+		log.Print(err)
 		return
 	}
 
-	// ★★★ [개선] 캐싱된 템플릿 사용
-	templates.ExecuteTemplate(w, "posts.html", posts)
+	postIDs := []int{}
+	err = db.Select(&postIDs, "SELECT `id` FROM `posts` WHERE `user_id` = ?", user.ID)
+	if err != nil {
+		log.Print(err)
+		return
+	}
+	postCount := len(postIDs)
+
+	commentedCount := 0
+	if postCount > 0 {
+		s := []string{}
+		for range postIDs {
+			s = append(s, "?")
+		}
+		placeholder := strings.Join(s, ", ")
+
+		// convert []int -> []interface{}
+		args := make([]interface{}, len(postIDs))
+		for i, v := range postIDs {
+			args[i] = v
+		}
+
+		err = db.Get(&commentedCount, "SELECT COUNT(*) AS count FROM `comments` WHERE `post_id` IN ("+placeholder+")", args...)
+		if err != nil {
+			log.Print(err)
+			return
+		}
+	}
+
+	me := getSessionUser(r)
+
+	fmap := template.FuncMap{
+		"imageURL": imageURL,
+	}
+
+	template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
+		getTemplPath("layout.html"),
+		getTemplPath("user.html"),
+		getTemplPath("posts.html"),
+		getTemplPath("post.html"),
+	)).Execute(w, struct {
+		Posts          []Post
+		User           User
+		PostCount      int
+		CommentCount   int
+		CommentedCount int
+		Me             User
+	}{posts, user, postCount, commentCount, commentedCount, me})
 }
 
-func getPostsID(w http.ResponseWriter, r *http.Request) {
-    pidStr := chi.URLParam(r, "id") // chi v5
-    pid, err := strconv.Atoi(pidStr)
+func getPosts(w http.ResponseWriter, r *http.Request) {
+    m, err := url.ParseQuery(r.URL.RawQuery)
     if err != nil {
-        w.WriteHeader(http.StatusNotFound)
+        w.WriteHeader(http.StatusInternalServerError)
+        log.Print(err)
+        return
+    }
+    maxCreatedAt := m.Get("max_created_at")
+    if maxCreatedAt == "" {
         return
     }
 
-    var p Post
-    err = db.Get(&p, "SELECT * FROM `posts` WHERE `id` = ?", pid)
-    if err == sql.ErrNoRows {
-        w.WriteHeader(http.StatusNotFound)
-        return
-    }
+    t, err := time.Parse(ISO8601Format, maxCreatedAt)
     if err != nil {
         log.Print(err)
-        http.Error(w, "Internal Server Error", http.StatusInternalServerError)
         return
     }
 
-    posts, err := makePosts([]Post{p}, getCSRFToken(r), true)
+    results := []Post{}
+    // LIMIT 절을 추가하여 postsPerPage 만큼만 DB에서 가져옴
+    err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC LIMIT ?", t.Format(ISO8601Format), postsPerPage)
     if err != nil {
         log.Print(err)
-        http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+        return
+    }
+
+    posts, err := makePosts(results, getCSRFToken(r), false)
+    if err != nil {
+        log.Print(err)
         return
     }
 
@@ -588,91 +710,140 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    me := getSessionUser(r)
+    fmap := template.FuncMap{
+        "imageURL": imageURL,
+    }
 
-    // ★★★ [개선] 캐싱된 템플릿 사용
-    templates.ExecuteTemplate(w, "post_id.html", struct {
-        Post Post
-        Me   User
-    }{posts[0], me})
+    template.Must(template.New("posts.html").Funcs(fmap).ParseFiles(
+        getTemplPath("posts.html"),
+        getTemplPath("post.html"),
+    )).Execute(w, posts)
 }
-func postIndex(w http.ResponseWriter, r *http.Request) {
+func getPostsID(w http.ResponseWriter, r *http.Request) {
+	pidStr := r.PathValue("id")
+	pid, err := strconv.Atoi(pidStr)
+	if err != nil {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	results := []Post{}
+	err = db.Select(&results, "SELECT * FROM `posts` WHERE `id` = ?", pid)
+	if err != nil {
+		log.Print(err)
+		return
+	}
+
+	posts, err := makePosts(results, getCSRFToken(r), true)
+	if err != nil {
+		log.Print(err)
+		return
+	}
+
+	if len(posts) == 0 {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	p := posts[0]
+
 	me := getSessionUser(r)
-	if !isLogin(me) {
-		http.Redirect(w, r, "/login", http.StatusFound)
-		return
+
+	fmap := template.FuncMap{
+		"imageURL": imageURL,
 	}
 
-	if r.FormValue("csrf_token") != getCSRFToken(r) {
-		w.WriteHeader(http.StatusUnprocessableEntity)
-		return
-	}
+	template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
+		getTemplPath("layout.html"),
+		getTemplPath("post_id.html"),
+		getTemplPath("post.html"),
+	)).Execute(w, struct {
+		Post Post
+		Me   User
+	}{p, me})
+}
 
-	file, header, err := r.FormFile("file")
-	if err != nil {
-		session := getSession(r)
-		session.Values["notice"] = "画像が必須です"
-		session.Save(r, w)
+func postIndex(w http.ResponseWriter, r *http.Request) {
+    me := getSessionUser(r)
+    if !isLogin(me) {
+        http.Redirect(w, r, "/login", http.StatusFound)
+        return
+    }
 
-		http.Redirect(w, r, "/", http.StatusFound)
-		return
-	}
+    if r.FormValue("csrf_token") != getCSRFToken(r) {
+        w.WriteHeader(http.StatusUnprocessableEntity)
+        return
+    }
 
-	mime := ""
-	if file != nil {
-		// 投稿のContent-Typeからファイルのタイプを決定する
-		contentType := header.Header["Content-Type"][0]
-		if strings.Contains(contentType, "jpeg") {
-			mime = "image/jpeg"
-		} else if strings.Contains(contentType, "png") {
-			mime = "image/png"
-		} else if strings.Contains(contentType, "gif") {
-			mime = "image/gif"
-		} else {
-			session := getSession(r)
-			session.Values["notice"] = "投稿できる画像形式はjpgとpngとgifだけです"
-			session.Save(r, w)
+    file, header, err := r.FormFile("file")
+    if err != nil {
+        session := getSession(r)
+        session.Values["notice"] = "画像が必須です"
+        session.Save(r, w)
 
-			http.Redirect(w, r, "/", http.StatusFound)
-			return
-		}
-	}
+        http.Redirect(w, r, "/", http.StatusFound)
+        return
+    }
 
-	filedata, err := io.ReadAll(file)
-	if err != nil {
-		log.Print(err)
-		return
-	}
+    mime := ""
+    if file != nil {
+        contentType := header.Header["Content-Type"][0]
+        if strings.Contains(contentType, "jpeg") {
+            mime = "image/jpeg"
+        } else if strings.Contains(contentType, "png") {
+            mime = "image/png"
+        } else if strings.Contains(contentType, "gif") {
+            mime = "image/gif"
+        } else {
+            session := getSession(r)
+            session.Values["notice"] = "投稿できる画像形式はjpgとpngとgifだけです"
+            session.Save(r, w)
 
-	if len(filedata) > UploadLimit {
-		session := getSession(r)
-		session.Values["notice"] = "ファイルサイズが大きすぎます"
-		session.Save(r, w)
+            http.Redirect(w, r, "/", http.StatusFound)
+            return
+        }
+    }
 
-		http.Redirect(w, r, "/", http.StatusFound)
-		return
-	}
+    filedata, err := io.ReadAll(file)
+    if err != nil {
+        log.Print(err)
+        return
+    }
 
-	query := "INSERT INTO `posts` (`user_id`, `mime`, `imgdata`, `body`) VALUES (?,?,?,?)"
-	result, err := db.Exec(
-		query,
-		me.ID,
-		mime,
-		filedata,
-		r.FormValue("body"),
-	)
-	if err != nil {
-		log.Print(err)
-		return
-	}
+    if len(filedata) > UploadLimit {
+        session := getSession(r)
+        session.Values["notice"] = "ファイルサイズが大きすぎます"
+        session.Save(r, w)
 
-	pid, err := result.LastInsertId()
-	if err != nil {
-		log.Print(err)
-		return
-	}
+        http.Redirect(w, r, "/", http.StatusFound)
+        return
+    }
 
-	http.Redirect(w, r, "/posts/"+strconv.FormatInt(pid, 10), http.StatusFound)
+    query := "INSERT INTO `posts` (`user_id`, `mime`, `imgdata`, `body`) VALUES (?,?,?,?)"
+    result, err := db.Exec(
+        query,
+        me.ID,
+        mime,
+        filedata,
+        r.FormValue("body"),
+    )
+    if err != nil {
+        log.Print(err)
+        return
+    }
+
+    pid, err := result.LastInsertId()
+    if err != nil {
+        log.Print(err)
+        return
+    }
+
+    // 새 게시글 작성 시 해당 게시글의 캐시 무효화
+    memcacheClient.Delete(fmt.Sprintf("post:%d", pid))
+    // 전체 게시글 목록에 영향을 미칠 수 있으므로, 관련 캐시도 무효화 고려 (예: 인덱스 페이지 캐시)
+    // 현재는 makePosts에서 캐싱이 개별 요소에 적용되므로 전체 무효화는 필요 없습니다.
+
+    http.Redirect(w, r, "/posts/"+strconv.FormatInt(pid, 10), http.StatusFound)
 }
 
 func getImage(w http.ResponseWriter, r *http.Request) {
@@ -684,10 +855,36 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	post := Post{}
-	err = db.Get(&post, "SELECT * FROM `posts` WHERE `id` = ?", pid)
-	if err != nil {
-		log.Print(err)
-		return
+
+	// キャッシュから投稿データを取得
+	cacheKey := fmt.Sprintf("post:%d", pid)
+	item, err := memcacheClient.Get(cacheKey)
+	if err == nil {
+		// キャッシュヒット
+		if err := json.Unmarshal(item.Value, &post); err != nil {
+			// キャッシュが壊れている場合はDBから取得
+			err = db.Get(&post, "SELECT * FROM `posts` WHERE `id` = ?", pid)
+			if err != nil {
+				log.Print(err)
+				return
+			}
+		}
+	} else {
+		// キャッシュミス、DBから取得
+		err = db.Get(&post, "SELECT * FROM `posts` WHERE `id` = ?", pid)
+		if err != nil {
+			log.Print(err)
+			return
+		}
+
+		// キャッシュに保存
+		if postJSON, err := json.Marshal(post); err == nil {
+			memcacheClient.Set(&memcache.Item{
+				Key:        cacheKey,
+				Value:      postJSON,
+				Expiration: 600, // 10分
+			})
+		}
 	}
 
 	ext := r.PathValue("ext")
@@ -708,56 +905,39 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 }
 
 func postComment(w http.ResponseWriter, r *http.Request) {
-	me := getSessionUser(r)
-	if !isLogin(me) {
-		http.Redirect(w, r, "/login", http.StatusFound)
-		return
-	}
+    me := getSessionUser(r)
+    if !isLogin(me) {
+        http.Redirect(w, r, "/login", http.StatusFound)
+        return
+    }
 
-	if r.FormValue("csrf_token") != getCSRFToken(r) {
-		w.WriteHeader(http.StatusUnprocessableEntity)
-		return
-	}
+    if r.FormValue("csrf_token") != getCSRFToken(r) {
+        w.WriteHeader(http.StatusUnprocessableEntity)
+        return
+    }
 
-	postID, err := strconv.Atoi(r.FormValue("post_id"))
-	if err != nil {
-		log.Print("post_idは整数のみです")
-		return
-	}
+    postID, err := strconv.Atoi(r.FormValue("post_id"))
+    if err != nil {
+        log.Print("post_idは整数のみです")
+        return
+    }
 
-	query := "INSERT INTO `comments` (`post_id`, `user_id`, `comment`) VALUES (?,?,?)"
-	_, err = db.Exec(query, postID, me.ID, r.FormValue("comment"))
-	if err != nil {
-		log.Print(err)
-		return
-	}
+    query := "INSERT INTO `comments` (`post_id`, `user_id`, `comment`) VALUES (?,?,?)"
+    _, err = db.Exec(query, postID, me.ID, r.FormValue("comment"))
+    if err != nil {
+        log.Print(err)
+        return
+    }
 
-	http.Redirect(w, r, fmt.Sprintf("/posts/%d", postID), http.StatusFound)
+    // 새 댓글 작성 시 해당 게시글의 댓글 관련 캐시 무효화
+    memcacheClient.Delete(fmt.Sprintf("comment_count:%d", postID))
+    memcacheClient.Delete(fmt.Sprintf("comments:%d:true", postID))
+    memcacheClient.Delete(fmt.Sprintf("comments:%d:false", postID))
+
+    http.Redirect(w, r, fmt.Sprintf("/posts/%d", postID), http.StatusFound)
 }
 
 func getAdminBanned(w http.ResponseWriter, r *http.Request) {
-	me := getSessionUser(r)
-	if !isLogin(me) || me.Authority == 0 {
-		http.Redirect(w, r, "/", http.StatusFound)
-		return
-	}
-
-	var users []User
-	err := db.Select(&users, "SELECT * FROM `users` WHERE `authority` = 0 AND `del_flg` = 0 ORDER BY `created_at` DESC")
-	if err != nil {
-		log.Print(err)
-		return
-	}
-
-	// ★★★ [개선] 캐싱된 템플릿 사용
-	templates.ExecuteTemplate(w, "banned.html", struct {
-		Users     []User
-		Me        User
-		CSRFToken string
-	}{users, me, getCSRFToken(r)})
-}
-
-func postAdminBanned(w http.ResponseWriter, r *http.Request) {
 	me := getSessionUser(r)
 	if !isLogin(me) {
 		http.Redirect(w, r, "/", http.StatusFound)
@@ -769,87 +949,134 @@ func postAdminBanned(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if r.FormValue("csrf_token") != getCSRFToken(r) {
-		w.WriteHeader(http.StatusUnprocessableEntity)
-		return
-	}
-
-	query := "UPDATE `users` SET `del_flg` = ? WHERE `id` = ?"
-
-	err := r.ParseForm()
+	users := []User{}
+	err := db.Select(&users, "SELECT * FROM `users` WHERE `authority` = 0 AND `del_flg` = 0 ORDER BY `created_at` DESC")
 	if err != nil {
 		log.Print(err)
 		return
 	}
 
-	for _, id := range r.Form["uid[]"] {
-		db.Exec(query, 1, id)
-	}
-
-	http.Redirect(w, r, "/admin/banned", http.StatusFound)
+	template.Must(template.ParseFiles(
+		getTemplPath("layout.html"),
+		getTemplPath("banned.html")),
+	).Execute(w, struct {
+		Users     []User
+		Me        User
+		CSRFToken string
+	}{users, me, getCSRFToken(r)})
 }
 
-// ... 라우터 및 main 함수 ...
+func postAdminBanned(w http.ResponseWriter, r *http.Request) {
+    me := getSessionUser(r)
+    if !isLogin(me) {
+        http.Redirect(w, r, "/", http.StatusFound)
+        return
+    }
+
+    if me.Authority == 0 {
+        w.WriteHeader(http.StatusForbidden)
+        return
+    }
+
+    if r.FormValue("csrf_token") != getCSRFToken(r) {
+        w.WriteHeader(http.StatusUnprocessableEntity)
+        return
+    }
+
+    err := r.ParseForm()
+    if err != nil {
+        log.Print(err)
+        return
+    }
+
+    uidsToBan := r.Form["uid[]"]
+    if len(uidsToBan) > 0 {
+        // Prepare placeholders for IN clause
+        placeholders := make([]string, len(uidsToBan))
+        args := make([]interface{}, len(uidsToBan))
+        for i, uidStr := range uidsToBan {
+            placeholders[i] = "?"
+            uid, err := strconv.Atoi(uidStr)
+            if err != nil {
+                log.Printf("Invalid UID in banned list: %s, Error: %v", uidStr, err)
+                continue // Skip invalid UIDs
+            }
+            args[i] = uid
+            // 밴된 사용자의 캐시 무효화
+            memcacheClient.Delete(fmt.Sprintf("user:%d", uid))
+        }
+
+        if len(args) > 0 { // Ensure there are valid UIDs to ban
+            query := fmt.Sprintf("UPDATE `users` SET `del_flg` = 1 WHERE `id` IN (%s)", strings.Join(placeholders, ","))
+            _, err := db.Exec(query, args...)
+            if err != nil {
+                log.Print(err)
+                return
+            }
+        }
+    }
+
+    http.Redirect(w, r, "/admin/banned", http.StatusFound)
+}
+
 func main() {
-    host := os.Getenv("ISUCONP_DB_HOST")
-    if host == "" {
-        host = "localhost"
-    }
-    port := os.Getenv("ISUCONP_DB_PORT")
-    if port == "" {
-        port = "3306"
-    }
-    _, err := strconv.Atoi(port)
-    if err != nil {
-        log.Fatalf("Failed to read DB port number from an environment variable ISUCONP_DB_PORT.\nError: %s", err.Error())
-    }
-    user := os.Getenv("ISUCONP_DB_USER")
-    if user == "" {
-        user = "root"
-    }
-    password := os.Getenv("ISUCONP_DB_PASSWORD")
-    dbname := os.Getenv("ISUCONP_DB_NAME")
-    if dbname == "" {
-        dbname = "isuconp"
-    }
+	host := os.Getenv("ISUCONP_DB_HOST")
+	if host == "" {
+		host = "localhost"
+	}
+	port := os.Getenv("ISUCONP_DB_PORT")
+	if port == "" {
+		port = "3306"
+	}
+	_, err := strconv.Atoi(port)
+	if err != nil {
+		log.Fatalf("Failed to read DB port number from an environment variable ISUCONP_DB_PORT.\nError: %s", err.Error())
+	}
+	user := os.Getenv("ISUCONP_DB_USER")
+	if user == "" {
+		user = "root"
+	}
+	password := os.Getenv("ISUCONP_DB_PASSWORD")
+	dbname := os.Getenv("ISUCONP_DB_NAME")
+	if dbname == "" {
+		dbname = "isuconp"
+	}
 
-    dsn := fmt.Sprintf(
-        "%s:%s@tcp(%s:%s)/%s?charset=utf8mb4&parseTime=true&loc=Local",
-        user,
-        password,
-        host,
-        port,
-        dbname,
-    )
+	dsn := fmt.Sprintf(
+		"%s:%s@tcp(%s:%s)/%s?charset=utf8mb4&parseTime=true&loc=Local",
+		user,
+		password,
+		host,
+		port,
+		dbname,
+	)
 
-    db, err = sqlx.Open("mysql", dsn)
-    if err != nil {
-        log.Fatalf("Failed to connect to DB: %s.", err.Error())
-    }
-    defer db.Close()
-	db.SetMaxOpenConns(10)
-	db.SetMaxIdleConns(10)
+	db, err = sqlx.Open("mysql", dsn)
+	if err != nil {
+		log.Fatalf("Failed to connect to DB: %s.", err.Error())
+	}
+	defer db.Close()
 
-    r := chi.NewRouter()
+	r := chi.NewRouter()
 
-    r.Get("/initialize", getInitialize)
-    r.Get("/login", getLogin)
-    r.Post("/login", postLogin)
-    r.Get("/register", getRegister)
-    r.Post("/register", postRegister)
-    r.Get("/logout", getLogout)
-    r.Get("/", getIndex)
-    r.Get("/posts", getPosts)
-    r.Get("/posts/{id}", getPostsID)
-    r.Post("/", postIndex)
-    r.Get("/image/{id}.{ext}", getImage)
-    r.Post("/comment", postComment)
-    r.Get("/admin/banned", getAdminBanned)
-    r.Post("/admin/banned", postAdminBanned)
-    r.Get(`/@{accountName:[a-zA-Z0-9_]+}`, getAccountName) // 사용자 이름 규칙에 맞춰 정규식 수정
-    r.Handle("/css/*", http.StripPrefix("/css/", http.FileServer(http.Dir("../public/css"))))
-    r.Handle("/js/*", http.StripPrefix("/js/", http.FileServer(http.Dir("../public/js"))))
+	r.Get("/initialize", getInitialize)
+	r.Get("/login", getLogin)
+	r.Post("/login", postLogin)
+	r.Get("/register", getRegister)
+	r.Post("/register", postRegister)
+	r.Get("/logout", getLogout)
+	r.Get("/", getIndex)
+	r.Get("/posts", getPosts)
+	r.Get("/posts/{id}", getPostsID)
+	r.Post("/", postIndex)
+	r.Get("/image/{id}.{ext}", getImage)
+	r.Post("/comment", postComment)
+	r.Get("/admin/banned", getAdminBanned)
+	r.Post("/admin/banned", postAdminBanned)
+	r.Get(`/@{accountName:[a-zA-Z]+}`, getAccountName)
+	r.Get("/*", func(w http.ResponseWriter, r *http.Request) {
+		http.FileServer(http.Dir("../public")).ServeHTTP(w, r)
+	})
 
-
-    log.Fatal(http.ListenAndServe(":8080", r))
+	log.Fatal(http.ListenAndServe(":8080", r))
 }
