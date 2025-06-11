@@ -646,25 +646,6 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 	)).Execute(w, posts)
 }
 
-// Post構造体完全対応の高速版getPosts
-func getPosts2(w http.ResponseWriter, r *http.Request) {
-	m, err := url.ParseQuery(r.URL.RawQuery)
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		log.Print(err)
-		return
-	}
-	maxCreatedAt := m.Get("max_created_at")
-	if maxCreatedAt == "" {
-		return
-	}
-
-	t, err := time.Parse(ISO8601Format, maxCreatedAt)
-	if err != nil {
-		log.Print(err)
-		return
-	}
-
 	// Post構造体完全対応のフラット構造体
 	type PostCompleteFlat struct {
 		// Post基本情報
@@ -697,6 +678,25 @@ func getPosts2(w http.ResponseWriter, r *http.Request) {
 		CommentAuthorAuthority   *int       `db:"comment_author_authority"`
 		CommentAuthorDelFlg      *int       `db:"comment_author_del_flg"`
 		CommentAuthorCreatedAt   *time.Time `db:"comment_author_created_at"`
+	}
+
+// Post構造体完全対応の高速版getPosts
+func getPosts2(w http.ResponseWriter, r *http.Request) {
+	m, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		log.Print(err)
+		return
+	}
+	maxCreatedAt := m.Get("max_created_at")
+	if maxCreatedAt == "" {
+		return
+	}
+
+	t, err := time.Parse(ISO8601Format, maxCreatedAt)
+	if err != nil {
+		log.Print(err)
+		return
 	}
 
 	query := `
