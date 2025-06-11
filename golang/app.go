@@ -534,7 +534,7 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 
 func getAccountName(w http.ResponseWriter, r *http.Request) {
     accountName := r.PathValue("accountName")
-    
+
     // 1. 사용자 정보를 가져옵니다.
     user := User{}
     err := db.Get(&user, "SELECT * FROM `users` WHERE `account_name` = ? AND `del_flg` = 0", accountName)
@@ -554,7 +554,7 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
         http.Error(w, "Internal Server Error", 500)
         return
     }
-    
+
     // 3. 최적화된 makePosts를 호출합니다.
     posts, err := makePosts(results, getCSRFToken(r), false)
     if err != nil {
@@ -644,6 +644,190 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 		getTemplPath("posts.html"),
 		getTemplPath("post.html"),
 	)).Execute(w, posts)
+}
+
+// Post構造体完全対応の高速版getPosts
+func getPosts2(w http.ResponseWriter, r *http.Request) {
+	m, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		log.Print(err)
+		return
+	}
+	maxCreatedAt := m.Get("max_created_at")
+	if maxCreatedAt == "" {
+		return
+	}
+
+	t, err := time.Parse(ISO8601Format, maxCreatedAt)
+	if err != nil {
+		log.Print(err)
+		return
+	}
+
+	// Post構造体完全対応のフラット構造体
+	type PostCompleteFlat struct {
+		// Post基本情報
+		PostID       int       `db:"post_id"`
+		PostUserID   int       `db:"post_user_id"`
+		PostImgdata  []byte    `db:"post_imgdata"`
+		PostBody     string    `db:"post_body"`
+		PostMime     string    `db:"post_mime"`
+		PostCreatedAt time.Time `db:"post_created_at"`
+
+		// 投稿者情報
+		PostAuthorID          int       `db:"post_author_id"`
+		PostAuthorAccountName string    `db:"post_author_account_name"`
+		PostAuthorPasshash    string    `db:"post_author_passhash"`
+		PostAuthorAuthority   int       `db:"post_author_authority"`
+		PostAuthorDelFlg      int       `db:"post_author_del_flg"`
+		PostAuthorCreatedAt   time.Time `db:"post_author_created_at"`
+
+		// コメント情報
+		CommentID        *int       `db:"comment_id"`
+		CommentPostID    *int       `db:"comment_post_id"`
+		CommentUserID    *int       `db:"comment_user_id"`
+		CommentContent   *string    `db:"comment_content"`
+		CommentCreatedAt *time.Time `db:"comment_created_at"`
+
+		// コメント投稿者情報
+		CommentAuthorID          *int       `db:"comment_author_id"`
+		CommentAuthorAccountName *string    `db:"comment_author_account_name"`
+		CommentAuthorPasshash    *string    `db:"comment_author_passhash"`
+		CommentAuthorAuthority   *int       `db:"comment_author_authority"`
+		CommentAuthorDelFlg      *int       `db:"comment_author_del_flg"`
+		CommentAuthorCreatedAt   *time.Time `db:"comment_author_created_at"`
+	}
+
+	query := `
+		SELECT
+			p.id as post_id,
+			p.user_id as post_user_id,
+			p.imgdata as post_imgdata,
+			p.body as post_body,
+			p.mime as post_mime,
+			p.created_at as post_created_at,
+
+			pu.id as post_author_id,
+			pu.account_name as post_author_account_name,
+			pu.passhash as post_author_passhash,
+			pu.authority as post_author_authority,
+			pu.del_flg as post_author_del_flg,
+			pu.created_at as post_author_created_at,
+
+			c.id as comment_id,
+			c.post_id as comment_post_id,
+			c.user_id as comment_user_id,
+			c.comment as comment_content,
+			c.created_at as comment_created_at,
+
+			cu.id as comment_author_id,
+			cu.account_name as comment_author_account_name,
+			cu.passhash as comment_author_passhash,
+			cu.authority as comment_author_authority,
+			cu.del_flg as comment_author_del_flg,
+			cu.created_at as comment_author_created_at
+
+		FROM posts p
+		LEFT JOIN users pu ON p.user_id = pu.id
+		LEFT JOIN (
+			SELECT *,
+				   ROW_NUMBER() OVER (PARTITION BY post_id ORDER BY created_at DESC) as comment_rank
+			FROM comments
+		) c ON p.id = c.post_id AND c.comment_rank <= 3
+		LEFT JOIN users cu ON c.user_id = cu.id
+		WHERE p.created_at <= ? AND pu.del_flg = 0
+		ORDER BY p.created_at DESC, c.created_at ASC
+		LIMIT 1000`
+
+	var rows []PostCompleteFlat
+	err = db.Select(&rows, query, t.Format(ISO8601Format))
+	if err != nil {
+		log.Print(err)
+		return
+	}
+
+	// フラットデータをPost構造体に変換
+	csrfToken := getCSRFToken(r)
+	posts := convertToPostStructure(rows, csrfToken)
+
+	if len(posts) == 0 {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	// postsPerPageで制限
+	if len(posts) > postsPerPage {
+		posts = posts[:postsPerPage]
+	}
+
+	fmap := template.FuncMap{
+		"imageURL": imageURL,
+	}
+
+	template.Must(template.New("posts.html").Funcs(fmap).ParseFiles(
+		getTemplPath("posts.html"),
+		getTemplPath("post.html"),
+	)).Execute(w, posts)
+}
+
+// フラットデータをPost構造体配列に変換
+func convertToPostStructure(rows []PostCompleteFlat, csrfToken string) []Post {
+	postMap := make(map[int]*Post)
+	var posts []Post
+
+	for _, row := range rows {
+		// 投稿が未処理の場合
+		if _, exists := postMap[row.PostID]; !exists {
+			post := Post{
+				ID:        row.PostID,
+				UserID:    row.PostUserID,
+				Imgdata:   row.PostImgdata,
+				Body:      row.PostBody,
+				Mime:      row.PostMime,
+				CreatedAt: row.PostCreatedAt,
+				User: User{
+					ID:          row.PostAuthorID,
+					AccountName: row.PostAuthorAccountName,
+					Passhash:    row.PostAuthorPasshash,
+					Authority:   row.PostAuthorAuthority,
+					DelFlg:      row.PostAuthorDelFlg,
+					CreatedAt:   row.PostAuthorCreatedAt,
+				},
+				CSRFToken: csrfToken,
+				Comments:  []Comment{},
+			}
+			posts = append(posts, post)
+			postMap[row.PostID] = &posts[len(posts)-1]
+		}
+
+		// コメントが存在する場合
+		if row.CommentID != nil {
+			comment := Comment{
+				ID:        *row.CommentID,
+				PostID:    *row.CommentPostID,
+				UserID:    *row.CommentUserID,
+				Comment:   *row.CommentContent,
+				CreatedAt: *row.CommentCreatedAt,
+				User: User{
+					ID:          *row.CommentAuthorID,
+					AccountName: *row.CommentAuthorAccountName,
+					Passhash:    *row.CommentAuthorPasshash,
+					Authority:   *row.CommentAuthorAuthority,
+					DelFlg:      *row.CommentAuthorDelFlg,
+					CreatedAt:   *row.CommentAuthorCreatedAt,
+				},
+			}
+			postMap[row.PostID].Comments = append(postMap[row.PostID].Comments, comment)
+		}
+	}
+
+	// コメント数を設定
+	for i := range posts {
+		posts[i].CommentCount = len(posts[i].Comments)
+	}
+
+	return posts
 }
 
 func getPostsID(w http.ResponseWriter, r *http.Request) {
